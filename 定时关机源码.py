@@ -1,9 +1,26 @@
+# -*- coding: utf-8 -*-
+"""定时关机 —— 粉色 tkinter 定时关机小工具 (Windows)
+
+用法: pythonw 定时关机源码.py   (或打包后的 定时关机.exe)
+
+保险机制(三段):
+  1) 到点先看键鼠是否空闲 → 空闲才关机(留 60 秒反悔窗口)
+  2) 正在用电脑 → 顺延 5 分钟后重新检查
+  3) 全程给 OS 布一个"名义时长 + 5 分钟"的兜底定时, 程序崩了/被关了也照样关
+
+设计取舍: 关闭窗口 = 结束本程序(省资源), OS 定时仍在跑;
+         下次打开会自动认出"上次的定时还在进行中", 可点取消关机撤销。
+"""
 import tkinter as tk
 import subprocess
 import math
 import ctypes
-from ctypes import wintypes
 import os
+import sys
+import json
+import time
+import tempfile
+from ctypes import wintypes
 
 
 # ── 保险机制参数 ──
@@ -12,22 +29,193 @@ POSTPONE_SECONDS = 300    # 使用中顺延: 5 分钟后再检查
 FINAL_GRACE = 60          # 判定空闲后: 留 60 秒反悔窗口
 FAILSAFE_PAD = 300        # OS 兜底定时比名义时长多 5 分钟(程序崩了也照样关)
 
-# 图标(与脚本同目录, 不存在则跳过)
-ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "定时关机图标.ico")
+# 图标(与脚本/exe 同目录, 不存在则跳过图标, 不影响程序运行)
+# 打包成 exe 后 __file__ 指向临时解包目录, 得改用 exe 自己所在目录
+if getattr(sys, "frozen", False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_PATH = os.path.join(_BASE_DIR, "定时关机图标.ico")
+
+# 单实例互斥体名 / 窗口标题(用于二次启动时把已有窗口拉到前台)
+MUTEX_NAME = "ShutdownTimer_SingleInstance_PockySketch"
+WINDOW_TITLE = "定时关机"
+
+# CREATE_NO_WINDOW: 无控制台进程(pythonw/exe)调 shutdown.exe 时,
+# 不加这个标志 Windows 会为子进程新建终端窗口 => 每次调用都弹一下终端窗,
+# 而且要多等约 0.8 秒。加上后不弹窗, 耗时降到几十毫秒。
+CREATE_NO_WINDOW = 0x08000000
+
+ERROR_ALREADY_EXISTS = 183
+
+
+def shutdown_cmd(*args):
+    """所有 shutdown 调用的唯一出口, 保证不弹终端窗口"""
+    return subprocess.run(["shutdown", *args],
+                          capture_output=True,
+                          creationflags=CREATE_NO_WINDOW)
+
+
+def state_path():
+    """上次设定的定时状态(判断"重开是否还有活着的定时")"""
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return os.path.join(base, "ShutdownTimer", "state.json")
+
+
+def uptime_seconds():
+    """本次开机已运行秒数"""
+    ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+    return ctypes.windll.kernel32.GetTickCount64() / 1000.0
+
+
+def boot_epoch():
+    """本次开机的 Unix 时间戳: 状态文件跨开机即作废"""
+    return time.time() - uptime_seconds()
 
 
 class ShutdownTimer:
-    def __init__(self):
+    def __init__(self, single_instance=True, restore_state=True):
+        self._mutex = None
+        if single_instance and not self.acquire_single_instance():
+            self.focus_existing_window()
+            raise SystemExit(0)
+
         self.root = tk.Tk()
-        self.root.title("定时关机")
+        self.root.title(WINDOW_TITLE)
         self.root.geometry("420x500")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # 时间源: 计时靠"截止时刻"反算, 不用秒数自加(会漂移)
+        self._now = time.monotonic
+        self.deadline = None
+
+        self.init_palette()
         self.apply_icon()
+        self.build_ui()
+
+        self.timer_running = False
+        self.remaining_seconds = 0
+        self.after_id = None
+        self.final_grace = False   # 已判定空闲, 进入最终关机倒计时
+        self.in_postpone = False   # 处于"检测到使用中"的顺延循环
+
+        self.root.configure(bg=self.BG)
+        self.update_ui()
+        self.update_countdown()
+        if restore_state:
+            self.restore_pending_state()
+
+        # 居中
+        self.root.update_idletasks()
+        w = self.root.winfo_reqwidth()
+        h = self.root.winfo_reqheight()
+        x = (self.root.winfo_screenwidth() - w) // 2
+        y = (self.root.winfo_screenheight() - h) // 2
+        self.root.geometry(f"+{x}+{y}")
+
+        self.root.mainloop()
+
+    # ═══════════════════════════════════════
+    #  单实例 / 状态文件
+    # ═══════════════════════════════════════
+
+    def acquire_single_instance(self):
+        """拿到互斥体 = 本程序唯一实例; 拿不到说明已经开着一个"""
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        self._mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
+
+    @staticmethod
+    def focus_existing_window():
+        """第二个实例: 把已经开着的窗口拉到前台, 自己退出"""
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.FindWindowW(None, WINDOW_TITLE)
+            if hwnd:
+                user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+                user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+    def save_state(self):
+        try:
+            path = state_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "boot_epoch": boot_epoch(),
+                    "deadline": time.time() + max(0, self.deadline - self._now()),
+                    "protect": bool(self.protect_var.get()),
+                    "total": self.total_seconds,
+                    "phase": ("grace" if self.final_grace else
+                              "postpone" if self.in_postpone else "counting"),
+                }, f)
+        except Exception:
+            pass
+
+    def clear_state(self):
+        try:
+            os.remove(state_path())
+        except OSError:
+            pass
+
+    def restore_pending_state(self):
+        """重开时认出上次还没到点的定时 —— 让"再次打开可以取消定时"看得见"""
+        try:
+            with open(state_path(), encoding="utf-8") as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            self.clear_state()
+            return
+        left = st.get("deadline", 0) - time.time()
+        # 同一次开机的判定要留容差: boot_epoch 由"当前时间 - 开机秒数"算得,
+        # 两次计算之间有毫秒级误差, 直接 != 比较会永远判定为"跨开机"
+        same_boot = abs(st.get("boot_epoch", 0) - boot_epoch()) < 30
+        if not same_boot or left <= 0:
+            # 跨了开机(说明已经关过机) 或 早就过点 → 作废
+            self.clear_state()
+            return
+        self.protect_var.set(bool(st.get("protect", True)))
+        self.total_seconds = int(st.get("total", 0))
+        self.deadline = self._now() + left
+        self.remaining_seconds = max(1, int(math.ceil(left)))
+        self.final_grace = st.get("phase") == "grace"
+        self.in_postpone = st.get("phase") == "postpone"
+        self.timer_running = True
+        self.update_ui()
+        self.update_countdown()
+        self.status_var.set("♻ 上次设定的关机仍在进行中，点「取消关机」可撤销")
+        self.status_label.config(fg=self.STATUS_ACTIVE)
+        self.after_id = self.root.after(1000, self.tick)
+
+    # ═══════════════════════════════════════
+    #  配色 / 图标
+    # ═══════════════════════════════════════
+
+    def init_palette(self):
+        # ── 粉色少女系配色 ──
+        self.BG          = "#FFF0F5"   # 薰衣草腮红底
+        self.CARD        = "#FFFAFD"   # 卡片白
+        self.TITLE       = "#D44A7A"   # 深玫瑰标题
+        self.SUB         = "#C78B9E"   # 灰粉副文本
+        self.ACCENT      = "#F08FB4"   # 主按钮粉
+        self.ACCENT2     = "#E8759E"   # 按钮 hover
+        self.CANCEL_BG   = "#FFB3B3"   # 取消按钮
+        self.CANCEL_HOVER = "#FF9E9E"  # 取消按钮 hover
+        self.INPUT_BG    = "#FFF8FA"   # 输入框底
+        self.INPUT_BORDER = "#F0C0D0"  # 输入框边
+        self.TEXT_ON_PINK = "#FFFFFF"  # 粉底白字
+        self.LACE        = "#FFD1DC"   # 蕾丝粉
+        self.LACE_DARK   = "#F0B8C8"   # 蕾丝深粉
+        self.STATUS_IDLE = "#C78B9E"
+        self.STATUS_ACTIVE = "#E8759E"
+        self.STATUS_WARN = "#E8A45A"
+        self.STATUS_ALERT = "#FF6B8A"
 
     def apply_icon(self):
-        """窗口 + 任务栏图标都换成自定义 ico。"""
+        """窗口 + 任务栏图标都换成自定义 ico。图标缺失只跳过图标, 程序照常运行。"""
         if not os.path.isfile(ICON_PATH):
             return
         # 标题栏图标 (失败不影响下面的任务栏图标)
@@ -64,43 +252,6 @@ class ShutdownTimer:
                                         icon_type, hicon)
         except Exception:
             pass
-
-        # ── 粉色少女系配色 ──
-        self.BG          = "#FFF0F5"   # 薰衣草腮红底
-        self.CARD        = "#FFFAFD"   # 卡片白
-        self.TITLE       = "#D44A7A"   # 深玫瑰标题
-        self.SUB         = "#C78B9E"   # 灰粉副文本
-        self.ACCENT      = "#F08FB4"   # 主按钮粉
-        self.ACCENT2     = "#E8759E"   # 按钮 hover
-        self.CANCEL_BG   = "#FFB3B3"   # 取消按钮
-        self.INPUT_BG    = "#FFF8FA"   # 输入框底
-        self.INPUT_BORDER = "#F0C0D0"  # 输入框边
-        self.TEXT_ON_PINK = "#FFFFFF"  # 粉底白字
-        self.LACE        = "#FFD1DC"   # 蕾丝粉
-        self.LACE_DARK   = "#F0B8C8"   # 蕾丝深粉
-        self.STATUS_IDLE = "#C78B9E"
-        self.STATUS_ACTIVE = "#E8759E"
-
-        self.root.configure(bg=self.BG)
-
-        self.timer_running = False
-        self.remaining_seconds = 0
-        self.after_id = None
-        self.final_grace = False   # 已判定空闲, 进入最终关机倒计时
-        self.in_postpone = False   # 处于"检测到使用中"的顺延循环
-
-        self.setup_ui()
-        self.update_ui()
-
-        # 居中
-        self.root.update_idletasks()
-        w = self.root.winfo_reqwidth()
-        h = self.root.winfo_reqheight()
-        x = (self.root.winfo_screenwidth() - w) // 2
-        y = (self.root.winfo_screenheight() - h) // 2
-        self.root.geometry(f"+{x}+{y}")
-
-        self.root.mainloop()
 
     # ═══════════════════════════════════════
     #  蕾丝边绘制
@@ -180,7 +331,7 @@ class ShutdownTimer:
     #  UI 布局
     # ═══════════════════════════════════════
 
-    def setup_ui(self):
+    def build_ui(self):
         # ── 顶部蕾丝 ──
         top_lace = tk.Canvas(self.root, width=420, height=56,
                              bg=self.BG, highlightthickness=0, bd=0)
@@ -307,7 +458,7 @@ class ShutdownTimer:
         self.start_btn.bind("<Button-1>", lambda e: self.start_shutdown())
         self.start_btn.bind("<Enter>", lambda e: self.start_btn.config(bg=self.ACCENT2))
         self.start_btn.bind("<Leave>", lambda e: self.start_btn.config(
-            bg=self.ACCENT2 if self.timer_running else self.ACCENT))
+            bg=self.LACE_DARK if self.timer_running else self.ACCENT))
         self.start_btn.pack(side="left", padx=4)
 
         self.cancel_btn = tk.Label(
@@ -320,9 +471,8 @@ class ShutdownTimer:
             cursor="hand2"
         )
         self.cancel_btn.bind("<Button-1>", lambda e: self.cancel_shutdown())
-        self.cancel_btn.bind("<Enter>", lambda e: self.cancel_btn.config(bg="#FF9E9E"))
-        self.cancel_btn.bind("<Leave>", lambda e: self.cancel_btn.config(
-            bg="#FF9E9E" if self.timer_running else self.CANCEL_BG))
+        self.cancel_btn.bind("<Enter>", lambda e: self.cancel_btn.config(bg=self.CANCEL_HOVER))
+        self.cancel_btn.bind("<Leave>", lambda e: self.cancel_btn.config(bg=self.CANCEL_BG))
         self.cancel_btn.pack(side="left", padx=4)
 
         # ── 状态 ──
@@ -341,7 +491,7 @@ class ShutdownTimer:
         self.draw_lace_bottom(bottom_lace)
 
     # ═══════════════════════════════════════
-    #  逻辑（不变）
+    #  逻辑
     # ═══════════════════════════════════════
 
     def set_preset(self, h, m):
@@ -367,34 +517,38 @@ class ShutdownTimer:
         total = self.get_total_seconds()
         if total <= 0:
             self.status_var.set("💢 请设置大于 0 的时间")
-            self.status_label.config(fg="#FF6B8A")
+            self.status_label.config(fg=self.STATUS_ALERT)
             return
         if total > 86400:
             self.status_var.set("💢 最长支持 24 小时")
-            self.status_label.config(fg="#FF6B8A")
+            self.status_label.config(fg=self.STATUS_ALERT)
             return
 
-        subprocess.run(["shutdown", "/a"], capture_output=True)
+        shutdown_cmd("/a")
         if self.protect_var.get():
             # 保险模式: OS 定时多留 5 分钟作兜底, 真正的决定在计时结束时做
-            subprocess.run(["shutdown", "/s", "/t", str(total + FAILSAFE_PAD)],
-                           capture_output=True)
+            shutdown_cmd("/s", "/t", str(total + FAILSAFE_PAD))
         else:
-            subprocess.run(["shutdown", "/s", "/t", str(total)], capture_output=True)
+            shutdown_cmd("/s", "/t", str(total))
 
+        self.total_seconds = total
+        self.deadline = self._now() + total
         self.timer_running = True
         self.final_grace = False
         self.in_postpone = False
         self.remaining_seconds = total
+        self.save_state()
         self.update_ui()
         self.update_countdown()
         self.after_id = self.root.after(1000, self.tick)
 
     def cancel_shutdown(self):
-        subprocess.run(["shutdown", "/a"], capture_output=True)
+        shutdown_cmd("/a")
+        self.clear_state()
         self.timer_running = False
         self.final_grace = False
         self.in_postpone = False
+        self.deadline = None
         self.remaining_seconds = 0
         if self.after_id:
             self.root.after_cancel(self.after_id)
@@ -403,48 +557,57 @@ class ShutdownTimer:
         self.status_var.set("💤 已取消定时关机")
         self.status_label.config(fg=self.STATUS_IDLE)
 
+    def remaining_from_deadline(self):
+        """按截止时刻反算剩余秒数 —— 不用每秒自减, 所以不会累积漂移"""
+        if self.deadline is None:
+            return 0
+        return max(0, int(math.ceil(self.deadline - self._now())))
+
     def tick(self):
         if not self.timer_running:
             return
-        if self.remaining_seconds > 0:
-            self.remaining_seconds -= 1
-            self.update_countdown()
-            if self.remaining_seconds == 0:
-                if self.protect_var.get() and not self.final_grace:
-                    # 保险模式: 到点先撤旧定时, 看用户是否在用
-                    self.check_user_activity()
-                    if not self.timer_running:
-                        return
-                else:
-                    self.timer_running = False
-                    self.update_ui()
-                    self.status_var.set("🌙 正在关机，晚安...")
-                    self.status_label.config(fg="#FF6B8A")
+        self.remaining_seconds = self.remaining_from_deadline()
+        if self.remaining_seconds <= 0:
+            if self.protect_var.get() and not self.final_grace:
+                # 保险模式: 到点先撤旧定时, 看用户是否在用
+                self.check_user_activity()
+                if not self.timer_running:
                     return
-            self.after_id = self.root.after(1000, self.tick)
+            else:
+                self.timer_running = False
+                self.deadline = None
+                self.clear_state()
+                self.update_ui()
+                self.status_var.set("🌙 正在关机，晚安...")
+                self.status_label.config(fg=self.STATUS_ALERT)
+                return
+        else:
+            self.update_countdown()
+        self.after_id = self.root.after(1000, self.tick)
 
     def check_user_activity(self):
         """保险机制: 计时结束时的最终裁决——空闲才关机, 使用中顺延"""
-        subprocess.run(["shutdown", "/a"], capture_output=True)
+        shutdown_cmd("/a")
         idle = self.get_idle_seconds()
         if idle >= IDLE_THRESHOLD:
             # 空闲 → 关机(留 60 秒反悔窗口)
-            subprocess.run(["shutdown", "/s", "/t", str(FINAL_GRACE)],
-                           capture_output=True)
+            shutdown_cmd("/s", "/t", str(FINAL_GRACE))
             self.final_grace = True
             self.in_postpone = False
+            self.deadline = self._now() + FINAL_GRACE
             self.remaining_seconds = FINAL_GRACE
             self.status_var.set("🌙 空闲检测通过，60 秒后关机（可点取消反悔）")
-            self.status_label.config(fg="#FF6B8A")
+            self.status_label.config(fg=self.STATUS_ALERT)
         else:
             # 使用中 → 顺延, 并重新布 OS 兜底定时
-            subprocess.run(["shutdown", "/s", "/t", str(POSTPONE_SECONDS + FAILSAFE_PAD)],
-                           capture_output=True)
+            shutdown_cmd("/s", "/t", str(POSTPONE_SECONDS + FAILSAFE_PAD))
             self.final_grace = False
             self.in_postpone = True
+            self.deadline = self._now() + POSTPONE_SECONDS
             self.remaining_seconds = POSTPONE_SECONDS
             self.status_var.set(f"♡ 检测到使用中，{POSTPONE_SECONDS // 60} 分钟后再检查")
-            self.status_label.config(fg="#E8A45A")
+            self.status_label.config(fg=self.STATUS_WARN)
+        self.save_state()
 
     @staticmethod
     def get_idle_seconds():
@@ -464,10 +627,10 @@ class ShutdownTimer:
         s = self.remaining_seconds % 60
         if self.final_grace:
             self.status_var.set(f"🌙 空闲通过，{m:02d}:{s:02d} 后关机（可点取消反悔）")
-            self.status_label.config(fg="#FF6B8A")
+            self.status_label.config(fg=self.STATUS_ALERT)
         elif self.in_postpone:
             self.status_var.set(f"♡ 使用中，{m:02d}:{s:02d} 后再次检查")
-            self.status_label.config(fg="#E8A45A")
+            self.status_label.config(fg=self.STATUS_WARN)
         else:
             self.status_var.set(f"⏳ {h:02d}:{m:02d}:{s:02d} 后关机")
             self.status_label.config(fg=self.STATUS_ACTIVE)
@@ -486,6 +649,7 @@ class ShutdownTimer:
             self.start_btn.config(bg=self.ACCENT, fg=self.TEXT_ON_PINK)
 
     def on_close(self):
+        """关窗 = 结束程序(省资源); OS 定时仍在跑, 下次打开能认出并取消"""
         self.root.destroy()
 
 
