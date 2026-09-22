@@ -2,6 +2,13 @@
 
 粉色 tkinter 界面的 Windows 定时关机小工具，带「使用中保护」保险机制。
 
+## 下载
+
+免安装单文件：[Releases](https://github.com/Pocky-sketch/shutdown-timer/releases/latest) →
+`ShutdownTimer-v1.0.0.exe`（Windows 10/11，无需 Python；下载后可改名成 `定时关机.exe`）。
+
+> 附件名用英文是因为 GitHub Release 附件会把非 ASCII 文件名规范化成 `default.exe`。
+
 ## 用法
 
 | 方式 | 操作 |
